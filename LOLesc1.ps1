@@ -424,7 +424,7 @@ CertificateTemplate = {0}
         ""
     }
     else {
-        "_continue_ = \"URL=tag:microsoft.com,2022-09-14:sid:$TargetSid\""
+        "_continue_ = `"&URL=tag:microsoft.com,2022-09-14:sid:$TargetSid`""
     }
 
     return ($infTemplate -f $TemplateName, $TargetSan, $TargetSid, $sidLine)
